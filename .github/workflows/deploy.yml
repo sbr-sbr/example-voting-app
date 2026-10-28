@@ -1,0 +1,120 @@
+name: Build, Scan, and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: voting-app-cluster
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      id-token: write  # For OIDC
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build vote image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY/vote:${{ github.sha }} vote/
+          docker build -t $ECR_REGISTRY/vote:latest vote/
+
+      - name: Build result image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY/result:${{ github.sha }} result/
+          docker build -t $ECR_REGISTRY/result:latest result/
+
+      - name: Build worker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY/worker:${{ github.sha }} worker/
+          docker build -t $ECR_REGISTRY/worker:latest worker/
+
+      - name: Run Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/vote:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'HIGH,CRITICAL'
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Push images to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker push $ECR_REGISTRY/vote:${{ github.sha }}
+          docker push $ECR_REGISTRY/vote:latest
+          docker push $ECR_REGISTRY/result:${{ github.sha }}
+          docker push $ECR_REGISTRY/result:latest
+          docker push $ECR_REGISTRY/worker:${{ github.sha }}
+          docker push $ECR_REGISTRY/worker:latest
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install voting ./helm/voting-chart \
+            --namespace default \
+            --set vote.image.tag=${{ github.sha }} \
+            --set result.image.tag=${{ github.sha }} \
+            --set worker.image.tag=${{ github.sha }} \
+            --wait
+
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/vote -n default --timeout=5m
+          kubectl rollout status deployment/result -n default --timeout=5m
+
+      - name: Get service endpoints
+        run: kubectl get svc -n default
